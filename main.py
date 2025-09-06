@@ -1,4 +1,4 @@
-"""Created Guka(i love boobs)"""
+"""Created Guka"""
 
 import json
 import os
