@@ -1,4 +1,4 @@
-""" (main v2) 23.09.2023 """
+""" (threadgoon v2.5) 23.09.2023 """
 
 from concurrent.futures import thread
 import json
@@ -57,3 +57,4 @@ for choice, thread in zip(choice_list, posts_collection):
             print("Downloading file: {}".format(file_name))
             with open('{}/{}'.format(thread_title, file_name), 'wb') as f:
                 f.write(r.content)
+
