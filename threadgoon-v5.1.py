@@ -9,6 +9,7 @@ import sys
 import time
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -19,15 +20,34 @@ from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
     from rich.panel import Panel
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+    )
     from rich.table import Table
 
     RICH_AVAILABLE = True
 except ImportError:
     Console = None
+    Group = None
+    Live = None
     Panel = None
+    BarColumn = None
+    DownloadColumn = None
+    Progress = None
+    SpinnerColumn = None
     Table = None
+    TextColumn = None
+    TimeRemainingColumn = None
+    TransferSpeedColumn = None
     RICH_AVAILABLE = False
 
 
@@ -61,13 +81,17 @@ LOG_FILE = "download-v5.log"
 PAGE_SIZE = 50
 
 
+file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.CRITICAL + 1)
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=[file_handler, console_handler],
 )
 logger = logging.getLogger(__name__)
 console = Console() if RICH_AVAILABLE else None
@@ -630,7 +654,10 @@ def download_matching_files(
         os.makedirs(target_directory, exist_ok=True)
     except OSError as exc:
         logger.error("Error creating directory %s: %s", target_directory, exc)
-        print(f"Ошибка при создании папки '{target_directory}': {exc}")
+        if RICH_AVAILABLE and console:
+            console.print("[red]✗ Ошибка создания папки загрузки[/red]")
+        else:
+            print("✗ Ошибка создания папки загрузки")
         stats.errors += 1
         return
 
@@ -641,80 +668,159 @@ def download_matching_files(
         thread_record.thread_id,
     )
 
-    progress_label = f"/{thread_record.board}/ {thread_record.thread_id}"
-    for matched_file in tqdm(thread_record.matched_files, desc=progress_label):
-        file_url = get_file_url(matched_file.board, matched_file.tim, matched_file.ext)
-        file_name = build_download_filename(matched_file)
-        file_path = os.path.join(target_directory, file_name)
-        download_success = False
+    use_rich_progress = (
+        RICH_AVAILABLE
+        and console
+        and Group
+        and Live
+        and Progress
+        and SpinnerColumn
+        and TextColumn
+        and BarColumn
+        and DownloadColumn
+        and TransferSpeedColumn
+        and TimeRemainingColumn
+    )
 
-        if os.path.exists(file_path):
-            logger.info("File already exists, skipping: %s", file_path)
-            stats.skipped_files += 1
-            continue
+    if use_rich_progress:
+        overall_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold green]Файлы треда"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total} файлов"),
+            TimeRemainingColumn(),
+            console=console,
+        )
+        file_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.fields[filename]}", justify="left"),
+            BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        )
+        overall_task = overall_progress.add_task("thread_files", total=len(thread_record.matched_files))
+        current_file_task = file_progress.add_task("current_file", filename="-", total=None, visible=False)
+        progress_context = Live(
+            Group(overall_progress, file_progress),
+            console=console,
+            refresh_per_second=10,
+        )
+    else:
+        overall_progress = None
+        file_progress = None
+        overall_task = None
+        current_file_task = None
+        progress_context = nullcontext()
 
-        try:
-            downloaded_size = 0
-            time.sleep(random.uniform(0.2, 0.8))
-            with session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
-                response.raise_for_status()
+    with progress_context:
+        for matched_file in thread_record.matched_files:
+            file_url = get_file_url(matched_file.board, matched_file.tim, matched_file.ext)
+            file_name = build_download_filename(matched_file)
+            file_path = os.path.join(target_directory, file_name)
+            download_success = False
 
-                with open(file_path, "xb") as output_stream:
-                    total_size = int(response.headers.get("content-length", 0))
-                    if total_size > 0:
-                        with tqdm(
-                            total=total_size,
-                            unit="B",
-                            unit_scale=True,
-                            unit_divisor=1024,
-                            desc=file_name,
-                            leave=False,
-                        ) as file_progress:
+            if os.path.exists(file_path):
+                logger.info("File already exists, skipping: %s", file_path)
+                stats.skipped_files += 1
+                if use_rich_progress and overall_progress is not None and overall_task is not None:
+                    overall_progress.advance(overall_task)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[yellow]⚠ Пропущен:[/yellow] {file_name}")
+                else:
+                    print(f"⚠ Пропущен: {file_name}")
+                continue
+
+            try:
+                downloaded_size = 0
+                time.sleep(random.uniform(0.2, 0.8))
+                with session.get(file_url, stream=True, timeout=REQUEST_TIMEOUT) as response:
+                    response.raise_for_status()
+
+                    with open(file_path, "xb") as output_stream:
+                        total_size = int(response.headers.get("content-length", 0))
+                        if use_rich_progress and file_progress is not None and current_file_task is not None:
+                            file_progress.update(
+                                current_file_task,
+                                filename=file_name,
+                                completed=0,
+                                total=total_size if total_size > 0 else None,
+                                visible=True,
+                            )
+
+                        if total_size > 0:
                             for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                                 if not chunk:
                                     continue
                                 output_stream.write(chunk)
                                 downloaded_size += len(chunk)
-                                file_progress.update(len(chunk))
-                    else:
-                        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                            if not chunk:
-                                continue
-                            output_stream.write(chunk)
-                            downloaded_size += len(chunk)
+                                if use_rich_progress and file_progress is not None and current_file_task is not None:
+                                    file_progress.update(current_file_task, advance=len(chunk))
+                        else:
+                            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                                if not chunk:
+                                    continue
+                                output_stream.write(chunk)
+                                downloaded_size += len(chunk)
+                                if use_rich_progress and file_progress is not None and current_file_task is not None:
+                                    file_progress.update(current_file_task, completed=downloaded_size)
 
-            stats.downloaded_files += 1
-            stats.downloaded_bytes += downloaded_size
-            download_success = True
-            logger.info("Downloaded file: %s", file_path)
-            print(f"Скачан файл: {file_path}")
-
-        except FileExistsError:
-            logger.info("File was created while downloading, skipping: %s", file_path)
-            stats.skipped_files += 1
-            continue
-        except Timeout:
-            logger.error("Timeout while downloading %s", file_url)
-            print(f"Ошибка: Превышено время ожидания при загрузке {file_name}")
-            stats.errors += 1
-        except RequestException as exc:
-            logger.error("Error downloading %s: %s", file_url, exc)
-            print(f"Ошибка при загрузке {file_name}: {exc}")
-            stats.errors += 1
-        except OSError as exc:
-            logger.error("Filesystem error for %s: %s", file_path, exc)
-            print(f"Ошибка записи файла {file_name}: {exc}")
-            stats.errors += 1
-        except Exception as exc:
-            logger.error("Unexpected error downloading %s: %s", file_url, exc, exc_info=True)
-            print(f"Неожиданная ошибка при обработке файла {file_name}: {exc}")
-            stats.errors += 1
-        finally:
-            if not download_success and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
+            except FileExistsError:
+                logger.info("File was created while downloading, skipping: %s", file_path)
+                stats.skipped_files += 1
+                if RICH_AVAILABLE and console:
+                    console.print(f"[yellow]⚠ Пропущен:[/yellow] {file_name}")
+                else:
+                    print(f"⚠ Пропущен: {file_name}")
+                continue
+            except Timeout:
+                logger.error("Timeout while downloading %s", file_url)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[red]✗ Ошибка:[/red] {file_name}")
+                else:
+                    print(f"✗ Ошибка: {file_name}")
+                stats.errors += 1
+            except RequestException as exc:
+                logger.error("Error downloading %s: %s", file_url, exc)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[red]✗ Ошибка:[/red] {file_name}")
+                else:
+                    print(f"✗ Ошибка: {file_name}")
+                stats.errors += 1
+            except OSError as exc:
+                logger.error("Filesystem error for %s: %s", file_path, exc)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[red]✗ Ошибка записи:[/red] {file_name}")
+                else:
+                    print(f"✗ Ошибка записи: {file_name}")
+                stats.errors += 1
+            except Exception as exc:
+                logger.error("Unexpected error downloading %s: %s", file_url, exc, exc_info=True)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[red]✗ Ошибка:[/red] {file_name}")
+                else:
+                    print(f"✗ Ошибка: {file_name}")
+                stats.errors += 1
+            else:
+                stats.downloaded_files += 1
+                stats.downloaded_bytes += downloaded_size
+                download_success = True
+                logger.info("Downloaded file: %s", file_path)
+                if RICH_AVAILABLE and console:
+                    console.print(f"[green]✓ Скачан:[/green] {file_name}")
+                else:
+                    print(f"✓ Скачан: {file_name}")
+            finally:
+                if use_rich_progress and file_progress is not None and current_file_task is not None:
+                    file_progress.update(current_file_task, visible=False)
+                if use_rich_progress and overall_progress is not None and overall_task is not None:
+                    overall_progress.advance(overall_task)
+                if not download_success and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
 
 
 def scan_boards_for_matches(
