@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "threadgoon"
+version = "6.0.0"
+description = "Local-first Textual TUI for browsing and downloading imageboard threads"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Threadgoon contributors" }]
+dependencies = [
+  "requests>=2.31",
+  "textual>=0.80",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+threadgoon = "threadgoon.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["threadgoon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"

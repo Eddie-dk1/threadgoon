@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+.threadgoon/
+output/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.coverage
+htmlcov/

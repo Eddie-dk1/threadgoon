@@ -1,0 +1,253 @@
+$background: #11130f;
+$surface: #191c17;
+$surface-2: #22261f;
+$text: #e8e5dc;
+$muted: #969b8f;
+$accent: #b8a273;
+$error: #d88778;
+
+Screen {
+    background: $background;
+    color: $text;
+}
+
+Header {
+    background: $surface;
+    color: $text;
+}
+
+Footer {
+    background: $surface;
+    color: $muted;
+}
+
+#global-status {
+    height: 1;
+    padding: 0 2;
+    background: $surface-2;
+    color: $muted;
+}
+
+#global-status.error-state {
+    color: $error;
+}
+
+TabbedContent {
+    background: $background;
+}
+
+TabPane {
+    padding: 1 2;
+}
+
+ContentSwitcher {
+    background: $background;
+}
+
+.toolbar {
+    height: 3;
+    align-vertical: middle;
+}
+
+.toolbar.secondary {
+    margin-bottom: 1;
+}
+
+.toolbar Button {
+    margin-right: 1;
+    min-width: 14;
+}
+
+.toolbar Input {
+    width: 1fr;
+    margin-right: 1;
+}
+
+Button {
+    background: $surface-2;
+    color: $text;
+    border: tall $surface-2;
+}
+
+Button:hover {
+    background: #2c3128;
+}
+
+Button:focus {
+    border: tall $accent;
+}
+
+Button.-primary {
+    background: $accent;
+    color: #171610;
+    border: tall $accent;
+    text-style: bold;
+}
+
+Input, Select {
+    background: $surface;
+    color: $text;
+    border: tall #343a30;
+}
+
+Input:focus, Select:focus {
+    border: tall $accent;
+}
+
+DataTable {
+    height: 1fr;
+    background: $background;
+    color: $text;
+    scrollbar-color: $accent;
+    scrollbar-background: $surface;
+}
+
+DataTable > .datatable--header {
+    background: $surface-2;
+    color: $accent;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #363a2f;
+    color: $text;
+}
+
+#catalog-state, #downloads-state {
+    height: 2;
+    padding: 0 1;
+    color: $muted;
+}
+
+.empty-state {
+    color: $muted;
+    text-style: italic;
+}
+
+.notice {
+    height: 2;
+    color: $accent;
+}
+
+.muted {
+    color: $muted;
+    margin-bottom: 1;
+}
+
+.modal-card {
+    width: 72;
+    height: 80%;
+    max-height: 38;
+    padding: 1 2;
+    background: $surface;
+    border: round #3b4036;
+    align: center top;
+}
+
+.compact-modal {
+    height: 16;
+}
+
+ModalScreen {
+    align: center middle;
+    background: rgba(5, 6, 4, 0.72);
+}
+
+.modal-title, .screen-title {
+    text-style: bold;
+    color: $accent;
+    height: 2;
+}
+
+.modal-actions {
+    height: 3;
+    margin-top: 1;
+    align-horizontal: right;
+}
+
+.modal-actions Button {
+    margin-left: 1;
+}
+
+SelectionList {
+    height: 1fr;
+    background: $background;
+    border: tall #343a30;
+}
+
+#settings-scroll {
+    width: 72;
+    max-width: 100%;
+    height: 1fr;
+    padding: 1 2 3 2;
+}
+
+.field-label {
+    color: $muted;
+    margin-top: 1;
+    height: 1;
+}
+
+#settings-scroll Input, #settings-scroll Select {
+    width: 100%;
+}
+
+.switch-row {
+    height: 3;
+    margin-top: 1;
+    align-vertical: middle;
+}
+
+.switch-row Switch {
+    margin-right: 1;
+}
+
+#settings-state {
+    color: $accent;
+    height: 2;
+    margin-top: 1;
+}
+
+#detail-screen {
+    background: $background;
+    padding: 1 2;
+}
+
+.screen-title-row {
+    height: 3;
+    align-vertical: middle;
+}
+
+.screen-title-row Button {
+    margin-right: 2;
+}
+
+#detail-scroll {
+    height: 1fr;
+}
+
+#detail-summary {
+    padding: 1 2;
+    margin-bottom: 1;
+    background: $surface;
+    border-left: thick $accent;
+}
+
+.attachment-row {
+    padding: 1 2;
+    margin-bottom: 1;
+    background: $surface;
+    color: $text;
+}
+
+RichLog {
+    background: $background;
+    color: $muted;
+    border: tall #343a30;
+}
+
+Markdown {
+    padding: 1 3;
+    background: $background;
+    color: $text;
+}

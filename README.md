@@ -1,101 +1,89 @@
-# threadgoon
+# Threadgoon 6.0
 
-`threadgoon` is a Python downloader for scanning multiple 4chan boards through the 4cdn JSON API, finding threads that match your file filters, and downloading media from the threads you choose.
+Локальный macOS TUI для просмотра каталогов, точного сканирования тредов, безопасной загрузки вложений и мониторинга новых файлов.
 
-The repository now includes `threadgoon-v5.1.py`, an extended version focused on:
+> Источник данных — [4chan](https://www.4chan.org/). Threadgoon не является официальным приложением и соблюдает ограничение JSON API: не более одного запроса метаданных в секунду.
 
-- scanning multiple boards in one run
-- filtering by file extension, keywords, and file size
-- concurrent thread processing
-- paginated interactive thread selection
-- safe file naming and structured output folders
-- retry handling, progress bars, and session logging
+## Особенности
 
-## Features
+- Быстрый просмотр по `catalog.json` без загрузки каждого треда.
+- Отдельный deep scan с точными размерами и фильтрами.
+- Полноэкранный интерфейс Textual с управлением клавиатурой.
+- Загрузка через `.part`, HTTP Range и проверку размера.
+- Очередь и мониторинг восстанавливаются после перезапуска.
+- Все конфигурационные, временные и пользовательские данные находятся внутри проекта.
 
-- Multi-board scan using the catalog and thread JSON endpoints.
-- Configurable file filters for `.webm`, `.mp4`, `.gif`, `.jpg`, `.jpeg`, and `.png`.
-- Optional keyword filtering based on post subject, comment text, and filename.
-- Optional minimum and maximum file size limits.
-- Concurrent thread fetches with retry/backoff handling for unstable requests.
-- Interactive pagination so you can browse matched threads before downloading.
-- Download summary with processed threads, matched threads, downloaded files, skipped files, errors, and total size.
-- `rich` terminal UI support when available, with plain terminal fallback otherwise.
+## Установка
 
-## Requirements
-
-- Python 3.10+
-- `requests`
-- `tqdm`
-- `rich` (optional, for nicer terminal output)
-
-## Installation
+Требуется Python 3.11 или новее. Рекомендуется проектное окружение:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-pip install requests tqdm rich
+.venv/bin/python -m pip install -e '.[dev]'
 ```
 
-## Configuration
+Команды не требуют глобальной установки и не создают runtime-данные вне проекта.
 
-The script is configured through constants near the top of `threadgoon-v5.1.py`.
-
-Important options:
-
-- `ALL_ADULT_BOARDS`: boards to scan
-- `ALLOWED_EXTENSIONS`: file types to match
-- `KEYWORDS`: keyword list used for matching post text
-- `MIN_MATCHED_FILES`: minimum number of matching files required for a thread
-- `MIN_FILE_SIZE` / `MAX_FILE_SIZE`: optional size filters in bytes
-- `MAX_WORKERS`: number of concurrent thread fetch workers
-- `OUTPUT_DIR`: base download directory
-- `PAGE_SIZE`: number of matched threads shown per page
-
-## Usage
+## Запуск
 
 ```bash
-python3 threadgoon-v5.1.py
+.venv/bin/threadgoon
+.venv/bin/threadgoon https://boards.4chan.org/gif/thread/123456
+.venv/bin/threadgoon --version
 ```
 
-Typical flow:
+Также поддерживается:
 
-1. The script scans the configured boards.
-2. It builds a summary of matching threads and files.
-3. It shows paginated results in the terminal.
-4. You choose thread indexes or ranges to download.
-5. Matching files are saved into structured folders under `output/`.
+```bash
+.venv/bin/python -m threadgoon
+```
 
-## Output Layout
+## Управление
 
-Downloaded files are stored like this:
+| Клавиша | Действие |
+| --- | --- |
+| `/` | поиск |
+| `Space` | выбрать тред |
+| `Enter` | открыть подробности |
+| `d` | добавить выбранное в загрузки |
+| `w` | добавить выбранное в мониторинг |
+| `r` | обновить каталоги |
+| `?` | справка |
+| `q` | выход |
+
+## Локальные данные
 
 ```text
+.threadgoon/config.toml
+.threadgoon/state.sqlite3
+.threadgoon/cache/
+.threadgoon/logs/
+.threadgoon/tmp/
 output/
-  <board>/
-    <thread_id>_<thread_title>/
-      <tim>_<original_filename>.<ext>
 ```
 
-## Logging
+Пути из конфигурации проверяются: приложение отклонит расположение за пределами корня проекта.
 
-The script writes runtime information to:
+## Режимы ключевых слов
 
-```text
-download-v5.log
+- `file_post`: файл выбирается, только если ключевое слово есть в его посте.
+- `whole_thread`: совпадение может быть в любом посте, после чего выбираются все подходящие вложения треда.
+
+## Тесты
+
+```bash
+.venv/bin/python -m pytest
 ```
 
-## Repository Contents
+Живые запросы к API не выполняются автоматическими тестами.
 
-- `threadgoon-v5.1.py`: latest extended downloader
-- `threadgoon-V4.1.py`: previous version
-- older legacy versions kept for reference
+Ограниченный ручной smoke-тест читает только список досок, один каталог и один
+тред, не скачивая медиа:
 
-## Notes
+```bash
+.venv/bin/python scripts/live_smoke.py --board po
+```
 
-- The script relies on public 4cdn JSON endpoints and may be affected by API changes, rate limits, or unavailable threads.
-- Use it responsibly and only in ways that comply with the target site's rules and the laws applicable in your location.
+## Лицензия
 
-## License
-
-See [LICENSE](LICENSE).
+Проект распространяется по лицензии MIT. См. [LICENSE](LICENSE).
