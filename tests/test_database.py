@@ -52,7 +52,7 @@ def test_schema_and_interrupted_job_recovery(project_dir: Path) -> None:
     reopened = Repository(path)
     recovered = reopened.get_download(job.id)
 
-    assert reopened.schema_version() == 1
+    assert reopened.schema_version() == 2
     assert recovered is not None
     assert recovered.status is DownloadStatus.PENDING
     reopened.close()

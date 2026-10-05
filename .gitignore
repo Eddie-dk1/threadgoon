@@ -8,3 +8,33 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
+.build/
+dist/
+native/.build/
+native/.swiftpm/
+
+# Local credentials, signing material and editor/agent state.
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
+.idea/
+.vscode/
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Runtime databases, backups and incomplete downloads, even outside the default folder.
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.part
+backups/

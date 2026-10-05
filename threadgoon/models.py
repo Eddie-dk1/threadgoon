@@ -83,6 +83,8 @@ class ThreadRecord:
     snippet: str = ""
     updated_at: float = 0.0
     attachments: list[Attachment] = field(default_factory=list)
+    thumbnail_url: str = ""
+    stale: bool = False
 
     @property
     def key(self) -> tuple[str, int]:

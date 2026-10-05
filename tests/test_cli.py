@@ -7,4 +7,4 @@ def test_version_flag(capsys) -> None:
         parser.parse_args(["--version"])
     except SystemExit as exc:
         assert exc.code == 0
-    assert "Threadgoon 6.0.0" in capsys.readouterr().out
+    assert "Threadgoon 6.1.0" in capsys.readouterr().out

@@ -1,0 +1,2 @@
+# Build tools are not runtime requirements on the destination Mac.
+pyinstaller==6.22.3

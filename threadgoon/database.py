@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import shutil
 import json
 import hashlib
 import os
@@ -31,11 +33,18 @@ _UNSET = object()
 class Repository:
     """Thread-safe repository with project-local SQLite migrations."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self._closed = False
+        self._lease = path.with_suffix(".lock").open("a+")
+        try:
+            fcntl.flock(self._lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._lease.close()
+            raise RuntimeError("Эта рабочая папка уже открыта в другом Threadgoon") from exc
         self.cache_dir = path.parent / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -49,12 +58,20 @@ class Repository:
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA temp_store = MEMORY")
         self._connection.execute("PRAGMA journal_mode = WAL")
-        self._migrate()
-        self.reset_interrupted_downloads()
+        try:
+            self._migrate()
+            self.reset_interrupted_downloads()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
-            self._connection.close()
+            if not self._closed:
+                self._closed = True
+                self._connection.close()
+                fcntl.flock(self._lease, fcntl.LOCK_UN)
+                self._lease.close()
 
     def _migrate(self) -> None:
         with self._lock, self._connection:
@@ -70,6 +87,14 @@ class Repository:
                 raise RuntimeError(
                     f"База данных создана более новой версией Threadgoon: {version}"
                 )
+            if 0 < version < self.SCHEMA_VERSION:
+                directory = self.path.parent / "backups" / f"v{version}-{time.time_ns()}"
+                directory.mkdir(parents=True)
+                with sqlite3.connect(directory / self.path.name) as backup:
+                    self._connection.backup(backup)
+                config = self.path.parent / "config.toml"
+                if config.exists():
+                    shutil.copy2(config, directory / config.name)
             if version < 1:
                 self._connection.executescript(
                     """
@@ -160,6 +185,11 @@ class Repository:
                     """
                 )
 
+            if version < 2:
+                self._connection.execute("ALTER TABLE threads ADD COLUMN thumbnail_url TEXT NOT NULL DEFAULT ''")
+                self._connection.execute("ALTER TABLE threads ADD COLUMN stale INTEGER NOT NULL DEFAULT 0")
+                self._connection.execute("UPDATE schema_version SET version = 2")
+
     def schema_version(self) -> int:
         with self._lock:
             row = self._connection.execute(
@@ -201,11 +231,11 @@ class Repository:
     ) -> None:
         now = time.time()
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        cache_path = self._cache_path(key)
-        temporary = cache_path.with_suffix(".json.tmp")
-        temporary.write_text(encoded, encoding="utf-8")
-        os.replace(temporary, cache_path)
         with self._lock, self._connection:
+            cache_path = self._cache_path(key)
+            temporary = cache_path.with_suffix(".json.tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            os.replace(temporary, cache_path)
             self._connection.execute(
                 """
                 INSERT INTO http_cache(key, payload, last_modified, etag, fetched_at)
@@ -300,19 +330,24 @@ class Repository:
                 """
                 INSERT INTO threads(
                     board, thread_id, title, semantic_url, source_url,
-                    file_count, total_size, accuracy, status, snippet, updated_at
+                    file_count, total_size, accuracy, status, snippet, updated_at, thumbnail_url, stale
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(board, thread_id) DO UPDATE SET
                     title = excluded.title,
                     semantic_url = excluded.semantic_url,
                     source_url = excluded.source_url,
-                    file_count = excluded.file_count,
-                    total_size = excluded.total_size,
-                    accuracy = excluded.accuracy,
+                    file_count = CASE WHEN excluded.accuracy = 'estimated' AND threads.accuracy = 'exact'
+                        THEN threads.file_count ELSE excluded.file_count END,
+                    total_size = CASE WHEN excluded.accuracy = 'estimated' AND threads.accuracy = 'exact'
+                        THEN threads.total_size ELSE excluded.total_size END,
+                    accuracy = CASE WHEN excluded.accuracy = 'estimated' AND threads.accuracy = 'exact'
+                        THEN threads.accuracy ELSE excluded.accuracy END,
                     status = excluded.status,
                     snippet = excluded.snippet,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    thumbnail_url = excluded.thumbnail_url,
+                    stale = excluded.stale
                 """,
                 (
                     record.board,
@@ -326,6 +361,8 @@ class Repository:
                     record.status.value,
                     record.snippet,
                     updated_at,
+                    record.thumbnail_url,
+                    int(record.stale),
                 ),
             )
 
@@ -398,6 +435,8 @@ class Repository:
             status=ThreadStatus(row["status"]),
             snippet=row["snippet"],
             updated_at=float(row["updated_at"]),
+            thumbnail_url=row["thumbnail_url"],
+            stale=bool(row["stale"]),
         )
 
     # Attachments
@@ -516,14 +555,14 @@ class Repository:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
                 ON CONFLICT(board, tim, ext, destination) DO UPDATE SET
                     status = CASE
-                        WHEN download_jobs.status = 'completed' THEN 'completed'
+                        WHEN download_jobs.status IN ('completed', 'downloading', 'pending', 'paused', 'cancelled', 'failed') THEN download_jobs.status
                         ELSE excluded.status
                     END,
                     expected_size = COALESCE(
                         excluded.expected_size, download_jobs.expected_size
                     ),
-                    error = NULL,
-                    updated_at = excluded.updated_at
+                    error = download_jobs.error,
+                    updated_at = download_jobs.updated_at
                 """,
                 (
                     attachment.board,
@@ -697,8 +736,8 @@ class Repository:
             self._connection.execute(
                 """
                 UPDATE watches
-                SET status = ?, last_checked = ?, last_error = ?
+                SET status = CASE WHEN status = 'paused' AND ? = 'active' THEN status ELSE ? END, last_checked = ?, last_error = ?
                 WHERE board = ? AND thread_id = ?
                 """,
-                (status.value, last_checked, last_error, board, thread_id),
+                (status.value, status.value, last_checked, last_error, board, thread_id),
             )

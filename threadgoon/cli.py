@@ -55,31 +55,20 @@ def create_app(
 ):
     from .app import ThreadgoonApp
 
-    paths = AppPaths.build(root)
-    paths.ensure()
-    config_path = paths.config_path(config_override)
-    config = load_config(paths, config_path)
-    logger = configure_logging(paths, verbose=verbose)
-    logger.info("Starting Threadgoon %s", __version__)
+    from .controller import Controller
 
     for url in initial_urls:
         parse_thread_url(url)
-
-    repository = Repository(paths.database)
-    api = ApiClient(repository, interval=config.api_interval)
-    scanner = ScanService(api, repository)
-    downloader = DownloadManager(
-        repository,
-        paths,
-        output_dir=config.output_dir,
-        max_workers=config.media_workers,
-    )
-    watcher = WatchService(
-        api,
-        repository,
-        downloader,
-        ScanFilters.from_config(config),
-    )
+    controller = Controller(root, config_override=config_override, verbose=verbose,
+                            start_background=start_background)
+    paths = controller.paths
+    config_path = controller.config_path
+    config = controller.config
+    repository = controller.repository
+    api = controller.api
+    scanner = controller.scanner
+    downloader = controller.downloader
+    watcher = controller.watcher
     return ThreadgoonApp(
         paths=paths,
         config=config,
@@ -91,6 +80,7 @@ def create_app(
         watcher=watcher,
         initial_urls=initial_urls,
         start_background=start_background,
+        controller=controller,
     )
 
 
@@ -111,7 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
-        app.repository.close()
+        app.controller.close()
     return 0
 
 

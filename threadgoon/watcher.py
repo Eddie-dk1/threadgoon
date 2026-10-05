@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Callable
 
-from .api import ApiClient, ApiNotFound
+from .api import ApiCancelled, ApiClient, ApiNotFound
 from .database import Repository
 from .downloader import DownloadManager
 from .models import (
@@ -49,6 +49,10 @@ class WatchService:
     ) -> WatchRecord:
         if interval < 10:
             raise ValueError("Интервал мониторинга не может быть меньше 10 секунд")
+        existing = next((watch for watch in self.repository.list_watches()
+                         if (watch.board, watch.thread_id) == (board, thread_id)), None)
+        if existing is not None:
+            return existing
         watch = WatchRecord(
             board=board,
             thread_id=thread_id,
@@ -79,6 +83,13 @@ class WatchService:
                 watch.thread_id,
                 cancel_event=self.stop_event,
             )
+            current = next((item for item in self.repository.list_watches()
+                            if (item.board, item.thread_id) == (watch.board, watch.thread_id)), None)
+            if current is None or current.status is not WatchStatus.ACTIVE or self.stop_event.is_set():
+                return None, 0, None
+            watch = current
+            if result.stale:
+                raise RuntimeError("Нет связи: показаны сохранённые данные. Проверка будет повторена.")
             if result.not_modified:
                 self.repository.update_watch(
                     watch.board,
@@ -114,6 +125,8 @@ class WatchService:
                 last_error=None,
             )
             return record, len(new_attachments), None
+        except ApiCancelled:
+            return None, 0, None
         except ApiNotFound:
             message = "Тред больше недоступен"
             self.repository.mark_thread_status(
@@ -152,14 +165,13 @@ class WatchService:
         *,
         on_update: WatchCallback | None = None,
     ) -> None:
-        self.reset()
         while not self.stop_event.is_set():
             watches = self.repository.list_watches()
             now = time.time()
             due = [
                 watch
                 for watch in watches
-                if watch.status is not WatchStatus.PAUSED
+                if watch.status is WatchStatus.ACTIVE
                 and (
                     watch.last_checked is None
                     or now - watch.last_checked >= watch.interval

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,16 @@ class AppConfig:
     auto_download_new: bool = False
 
     def validate(self, paths: AppPaths) -> None:
+        for name in ("boards", "extensions", "keywords"):
+            values = getattr(self, name)
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise ConfigurationError(f"{name}: ожидается список строк")
+        for name in ("watch_interval", "media_workers", "min_matched_files", "min_file_size", "max_file_size"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ConfigurationError(f"{name}: ожидается целое число")
+        if not isinstance(self.api_interval, (int, float)) or not math.isfinite(self.api_interval):
+            raise ConfigurationError("Интервал API должен быть конечным числом")
         self.boards = list(dict.fromkeys(_normalize_board(item) for item in self.boards))
         self.extensions = list(
             dict.fromkeys(_normalize_extension(item) for item in self.extensions)
@@ -156,7 +167,9 @@ def save_config(config: AppConfig, paths: AppPaths, config_path: Path | None = N
             "",
         ]
     )
-    path.write_text("\n".join(lines), encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("\n".join(lines), encoding="utf-8")
+    temporary.replace(path)
 
 
 def _toml_list(values: list[str]) -> str:

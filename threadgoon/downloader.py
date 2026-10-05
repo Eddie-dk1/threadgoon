@@ -60,13 +60,18 @@ class DownloadManager:
         self.stop_event = threading.Event()
         self._job_cancel: dict[int, threading.Event] = {}
         self._control_lock = threading.Lock()
+        self._processing_lock = threading.Lock()
         self.logger = logging.getLogger("threadgoon.download")
 
     def pause(self) -> None:
         self.pause_event.clear()
+        for job in self.repository.list_downloads([DownloadStatus.PENDING]):
+            self.repository.update_download(job.id, status=DownloadStatus.PAUSED)
 
-    def resume(self) -> None:
+    def resume(self, *, include_paused: bool = True) -> None:
         self.pause_event.set()
+        if not include_paused:
+            return
         jobs = self.repository.list_downloads([DownloadStatus.PAUSED])
         for job in jobs:
             self.repository.update_download(
@@ -165,7 +170,14 @@ class DownloadManager:
         *,
         on_update: DownloadCallback | None = None,
     ) -> list[DownloadJob]:
-        self.reset_control()
+        if not self._processing_lock.acquire(blocking=False):
+            return []
+        try:
+            return self._process_pending(on_update=on_update)
+        finally:
+            self._processing_lock.release()
+
+    def _process_pending(self, *, on_update: DownloadCallback | None = None) -> list[DownloadJob]:
         jobs = self.repository.list_downloads([DownloadStatus.PENDING])
         if not jobs:
             return []
@@ -181,8 +193,9 @@ class DownloadManager:
             for future in as_completed(futures):
                 try:
                     job = future.result()
-                except Exception:
-                    job = self.repository.get_download(futures[future])
+                except Exception as exc:
+                    self.repository.update_download(futures[future], status=DownloadStatus.FAILED, error=str(exc))
+                    job = self._notify(futures[future], on_update)
                     if job is None:
                         continue
                 completed.append(job)
@@ -196,51 +209,31 @@ class DownloadManager:
         job = self.repository.get_download(job_id)
         if job is None:
             raise DownloadError(f"Задание {job_id} не найдено")
+        if job.status is not DownloadStatus.PENDING:
+            return self._notify(job.id, on_update)
         cancel_event = self._cancel_event(job_id)
-        if cancel_event.is_set():
-            raise DownloadInterrupted("Задание отменено")
-
-        destination = self.paths.local_path(job.destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        part_path = destination.with_name(destination.name + ".part")
-        self.paths.local_path(part_path)
-        expected = job.expected_size
-
-        if destination.exists() and expected is not None:
-            if destination.stat().st_size == expected:
-                self.repository.update_download(
-                    job.id,
-                    status=DownloadStatus.COMPLETED,
-                    downloaded_size=expected,
-                    error=None,
-                )
-                self.repository.mark_attachment_downloaded(
-                    job.board,
-                    job.tim,
-                    job.ext,
-                    str(destination.relative_to(self.paths.root)),
-                )
-                return self._notify(job.id, on_update)
-
-        existing_part = part_path.stat().st_size if part_path.exists() else 0
-        self._ensure_space(destination.parent, expected, existing_part)
-        self.repository.update_download(
-            job.id,
-            status=DownloadStatus.DOWNLOADING,
-            downloaded_size=existing_part,
-            error=None,
-        )
-        self._notify(job.id, on_update)
-
-        session = self.session_factory()
-        session.headers.update(
-            {
-                "User-Agent": "threadgoon/6.0",
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-            }
-        )
+        part_path: Path | None = None
+        session = None
         try:
+            self._wait_for_control(cancel_event)
+            destination = self.paths.local_path(job.destination)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            part_path = self.paths.local_path(destination.with_name(destination.name + ".part"))
+            expected = job.expected_size
+            if destination.exists() and expected is not None and destination.stat().st_size == expected:
+                self.repository.update_download(job.id, status=DownloadStatus.COMPLETED,
+                                                downloaded_size=expected, error=None)
+                self.repository.mark_attachment_downloaded(job.board, job.tim, job.ext,
+                                                          str(destination.relative_to(self.paths.root)))
+                return self._notify(job.id, on_update)
+            existing_part = part_path.stat().st_size if part_path.exists() else 0
+            self._ensure_space(destination.parent, expected, existing_part)
+            self.repository.update_download(job.id, status=DownloadStatus.DOWNLOADING,
+                                            downloaded_size=existing_part, error=None)
+            self._notify(job.id, on_update)
+            session = self.session_factory()
+            session.headers.update({"User-Agent": "threadgoon/6.1", "Accept": "*/*",
+                                    "Accept-Encoding": "identity"})
             total = self._stream(
                 session,
                 job,
@@ -257,6 +250,7 @@ class DownloadManager:
                 )
             if actual <= 0:
                 raise DownloadError("Сервер вернул пустой файл")
+            self._wait_for_control(cancel_event)
             os.replace(part_path, destination)
             relative = str(destination.relative_to(self.paths.root))
             self.repository.mark_attachment_downloaded(
@@ -271,21 +265,21 @@ class DownloadManager:
             )
             self.logger.info("Downloaded %s", relative)
         except DownloadInterrupted as exc:
-            if self.stop_event.is_set():
-                status = DownloadStatus.PENDING
-            elif cancel_event.is_set():
+            if cancel_event.is_set():
                 status = DownloadStatus.CANCELLED
+            elif self.stop_event.is_set():
+                status = DownloadStatus.PENDING
             else:
                 status = DownloadStatus.PAUSED
-            current_size = part_path.stat().st_size if part_path.exists() else 0
+            current_size = _part_size(part_path)
             self.repository.update_download(
                 job.id,
                 status=status,
                 downloaded_size=current_size,
                 error=None if status is DownloadStatus.PENDING else str(exc),
             )
-        except (OSError, RequestException, DownloadError) as exc:
-            current_size = part_path.stat().st_size if part_path.exists() else 0
+        except Exception as exc:
+            current_size = _part_size(part_path)
             self.repository.update_download(
                 job.id,
                 status=DownloadStatus.FAILED,
@@ -294,7 +288,8 @@ class DownloadManager:
             )
             self.logger.warning("Download failed for %s: %s", job.url, exc)
         finally:
-            session.close()
+            if session is not None:
+                session.close()
         return self._notify(job.id, on_update)
 
     def _stream(
@@ -327,20 +322,27 @@ class DownloadManager:
                 timeout=self.timeout,
             )
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+            if offset and response.status_code == 206:
+                match = _CONTENT_RANGE.fullmatch(response.headers.get("Content-Range", ""))
+                if not match or int(match.group(1)) != offset:
+                    raise DownloadError("Сервер вернул неверный диапазон для докачивания")
+        except BaseException:
+            response.close()
+            raise
         append = bool(offset and response.status_code == 206)
         if not append:
             offset = 0
-        expected = _expected_total(response, offset)
-        if job.expected_size is not None:
-            expected = job.expected_size
-        self._ensure_space(part_path.parent, expected, offset)
-        self.repository.update_download(job.id, expected_size=expected)
-
-        mode = "ab" if append else "wb"
-        downloaded = offset
-        last_report = downloaded
         try:
+            expected = _expected_total(response, offset)
+            if job.expected_size is not None:
+                expected = job.expected_size
+            self._ensure_space(part_path.parent, expected, offset)
+            self.repository.update_download(job.id, expected_size=expected)
+            mode = "ab" if append else "wb"
+            downloaded = offset
+            last_report = downloaded
             with part_path.open(mode) as stream:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
                     self._wait_for_control(cancel_event)
@@ -367,9 +369,8 @@ class DownloadManager:
             raise DownloadInterrupted("Отменено пользователем")
         if self.stop_event.is_set():
             raise DownloadInterrupted("Приложение остановлено")
-        while not self.pause_event.wait(0.1):
-            if cancel_event.is_set() or self.stop_event.is_set():
-                raise DownloadInterrupted("Загрузка приостановлена")
+        if not self.pause_event.is_set():
+            raise DownloadInterrupted("Загрузка приостановлена")
 
     def _cancel_event(self, job_id: int) -> threading.Event:
         with self._control_lock:
@@ -403,15 +404,22 @@ class DownloadManager:
         return job
 
 
-_CONTENT_RANGE = re.compile(r"bytes\s+\d+-\d+/(\d+|\*)", re.IGNORECASE)
+_CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 
 def _expected_total(response: requests.Response, offset: int) -> int | None:
     content_range = response.headers.get("Content-Range", "")
     match = _CONTENT_RANGE.match(content_range)
-    if match and match.group(1) != "*":
-        return int(match.group(1))
+    if match and match.group(3) != "*":
+        return int(match.group(3))
     content_length = response.headers.get("Content-Length")
     if content_length and content_length.isdigit():
         return offset + int(content_length)
     return None
+
+
+def _part_size(path: Path | None) -> int:
+    try:
+        return path.stat().st_size if path is not None and path.exists() else 0
+    except OSError:
+        return 0

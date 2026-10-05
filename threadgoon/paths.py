@@ -43,7 +43,7 @@ class AppPaths:
     def build(cls, root: Path | None = None) -> "AppPaths":
         project_root = (root or discover_project_root()).resolve()
         runtime = project_root / ".threadgoon"
-        return cls(
+        paths = cls(
             root=project_root,
             runtime=runtime,
             config=runtime / "config.toml",
@@ -53,6 +53,9 @@ class AppPaths:
             temp=runtime / "tmp",
             output=project_root / "output",
         )
+        for location in (paths.runtime, paths.config, paths.database, paths.database.with_suffix(".lock"), paths.cache, paths.logs, paths.temp, paths.output):
+            paths.local_path(location)
+        return paths
 
     def ensure(self) -> None:
         for directory in (self.runtime, self.cache, self.logs, self.temp, self.output):

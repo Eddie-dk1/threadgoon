@@ -98,10 +98,11 @@ class ApiClient:
         self.timeout = timeout
         self.max_attempts = max(1, max_attempts)
         self.limiter = limiter or RateLimiter(interval)
+        self._request_lock = threading.Lock()
         self.logger = logging.getLogger("threadgoon.api")
         self.session.headers.update(
             {
-                "User-Agent": "threadgoon/6.0",
+                "User-Agent": "threadgoon/6.1",
                 "Accept": "application/json, text/plain, */*",
             }
         )
@@ -148,6 +149,16 @@ class ApiClient:
         cancel_event: threading.Event | None = None,
         allow_stale: bool = True,
     ) -> ApiResult:
+        while not self._request_lock.acquire(timeout=0.1):
+            if cancel_event and cancel_event.is_set():
+                raise ApiCancelled("Операция отменена")
+        try:
+            return self._get_json(cache_key, url, cancel_event=cancel_event, allow_stale=allow_stale)
+        finally:
+            self._request_lock.release()
+
+    def _get_json(self, cache_key: str, url: str, *,
+                  cancel_event: threading.Event | None, allow_stale: bool) -> ApiResult:
         cache = self.repository.get_cache(cache_key)
         headers: dict[str, str] = {}
         if cache and cache.last_modified:
@@ -254,7 +265,7 @@ class ApiClient:
         while time.monotonic() < deadline:
             if cancel_event and cancel_event.is_set():
                 raise ApiCancelled("Операция отменена")
-            time.sleep(min(0.1, deadline - time.monotonic()))
+            time.sleep(max(0, min(0.1, deadline - time.monotonic())))
 
 
 def _parse_retry_after(value: str | None) -> float | None:

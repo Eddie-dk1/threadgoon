@@ -1,13 +1,13 @@
-"""Textual user interface for Threadgoon 6.0."""
+"""Textual user interface for Threadgoon 6.1."""
 
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
@@ -51,7 +51,7 @@ from .watcher import WatchService
 
 
 HELP_MARKDOWN = """
-# Threadgoon 6.0
+# Threadgoon 6.1
 
 **Источник данных:** [4chan](https://www.4chan.org/). Приложение не является
 официальным продуктом 4chan.
@@ -191,7 +191,7 @@ class ThreadDetailScreen(Screen[None]):
 class ThreadgoonApp(App[None]):
     """Full-screen project-local Threadgoon application."""
 
-    TITLE = "Threadgoon 6.0"
+    TITLE = "Threadgoon 6.1"
     SUB_TITLE = "локальный каталог и загрузки"
     CSS_PATH = "styles.tcss"
     MIN_SIZE = (80, 24)
@@ -220,8 +220,12 @@ class ThreadgoonApp(App[None]):
         watcher: WatchService,
         initial_urls: Sequence[str] = (),
         start_background: bool = True,
+        controller=None,
     ):
         super().__init__()
+        self.controller = controller
+        self._prepared_token = ""
+        self._scan_operation_id = ""
         self.paths = paths
         self.config = config
         self.config_path = config_path
@@ -253,10 +257,12 @@ class ThreadgoonApp(App[None]):
                 with Horizontal(classes="toolbar"):
                     yield Button("Доски", id="choose-boards")
                     yield Button("Быстрое сканирование", id="fast-scan", variant="primary")
-                    yield Button("Deep scan", id="deep-scan")
+                    yield Button("Уточнить", id="deep-scan")
+                    yield Button("Скачать", id="queue-selected")
+                    yield Button("Наблюдать", id="watch-selected")
                 with Horizontal(classes="toolbar"):
-                    yield Button("Пауза", id="pause-scan")
-                    yield Button("Отмена", id="cancel-scan")
+                    yield Button("Пауза", id="pause-scan", disabled=True)
+                    yield Button("Отмена", id="cancel-scan", disabled=True)
                 with Horizontal(classes="toolbar secondary"):
                     yield Input(
                         placeholder="Поиск по доске, ID или названию",
@@ -380,16 +386,67 @@ class ThreadgoonApp(App[None]):
         self._setup_tables()
         self._reload_from_database()
         self._load_log_tail()
-        if self.start_background:
-            self._start_watch_worker()
+        if self.controller:
+            self.controller.emit = self._controller_event_from_worker
         if self.initial_urls:
             self._import_urls(self.initial_urls)
 
     def on_unmount(self) -> None:
-        self.scanner.cancel()
-        self.downloader.stop()
-        self.watcher.stop()
-        self.api.close()
+        if self.controller:
+            self.controller.stop()
+
+    def _controller_event_from_worker(self, event: str, data: dict) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self._controller_event(event, data)
+        elif self.is_running:
+            try:
+                self.call_from_thread(self._controller_event, event, data)
+            except RuntimeError:
+                return
+
+    def _controller_event(self, event: str, data: dict) -> None:
+        if not self.is_mounted:
+            return
+        if event == "snapshot":
+            self.config = self.controller.config
+            self._reload_from_database()
+        elif event == "download_update":
+            self._render_downloads()
+            self._render_history()
+        elif event == "operation":
+            self._set_status(data["message"])
+            if data["group"] == "search":
+                self._scan_operation_id = data["id"]
+                self.query_one("#fast-scan", Button).disabled = True
+                self.query_one("#deep-scan", Button).disabled = True
+                self.query_one("#pause-scan", Button).disabled = data["state"] == "cancelling"
+                self.query_one("#cancel-scan", Button).disabled = data["state"] == "cancelling"
+        elif event == "operation_finished":
+            if data["group"] == "search":
+                self._scan_operation_id = ""
+                self.query_one("#fast-scan", Button).disabled = False
+                self.query_one("#deep-scan", Button).disabled = False
+                self.query_one("#pause-scan", Button).disabled = True
+                self.query_one("#pause-scan", Button).label = "Пауза"
+                self.query_one("#cancel-scan", Button).disabled = True
+            if data["state"] == "failed":
+                self._show_error(data["error"])
+            elif data["state"] == "cancelled":
+                self._set_status("Операция отменена")
+            elif data["group"] == "prepare":
+                self._prepared_token = data["result"]["token"]
+                self._confirm_downloads(self.controller._prepared[self._prepared_token])
+            elif data["group"] == "watch-add":
+                self._watches_prepared(data["result"]["count"])
+            else:
+                self._set_status("Готово")
+            self._reload_from_database()
+
+    def _command(self, command: str, params: dict | None = None) -> None:
+        try:
+            self.controller.dispatch(command, params or {})
+        except Exception as exc:
+            self._show_error(str(exc))
 
     def _setup_tables(self) -> None:
         catalog = self.query_one("#catalog-table", DataTable)
@@ -417,6 +474,9 @@ class ThreadgoonApp(App[None]):
         self._render_history()
 
     def _render_catalog(self) -> None:
+        table = self.query_one("#catalog-table", DataTable)
+        current_key = (self.visible_records[table.cursor_row].key
+                       if 0 <= table.cursor_row < len(self.visible_records) else None)
         search = self.query_one("#search", Input).value.casefold().strip()
         records = [
             item
@@ -443,6 +503,10 @@ class ThreadgoonApp(App[None]):
                 _format_time(item.updated_at),
                 key=f"{item.board}:{item.thread_id}",
             )
+        if current_key:
+            index = next((i for i, record in enumerate(records) if record.key == current_key), None)
+            if index is not None:
+                table.move_cursor(row=index, animate=False)
         state = self.query_one("#catalog-state", Static)
         if records:
             state.update(
@@ -600,41 +664,33 @@ class ThreadgoonApp(App[None]):
             self._choose_boards()
         elif action == "fast-scan":
             self._start_fast_scan()
+        elif action == "queue-selected":
+            self.action_queue_download()
+        elif action == "watch-selected":
+            self.action_watch_selected()
         elif action == "deep-scan":
             records = self._selected_records() or self.visible_records
             self._start_deep_scan(records)
         elif action == "pause-scan":
-            if self.scanner.pause_event.is_set():
-                self.scanner.pause()
-                event.button.label = "Продолжить"
-                self._set_status("Deep scan приостановлен")
-            else:
-                self.scanner.resume()
-                event.button.label = "Пауза"
-                self._set_status("Deep scan продолжен")
+            paused = str(event.button.label) == "Продолжить"
+            self._command("resume_operation" if paused else "pause_operation",
+                          {"operation_id": self._scan_operation_id})
+            event.button.label = "Пауза" if paused else "Продолжить"
         elif action == "cancel-scan":
-            self.scanner.cancel()
-            self._set_status("Сканирование отменяется")
+            self._command("cancel_operation", {"operation_id": self._scan_operation_id})
         elif action == "start-downloads":
-            self._ensure_download_worker()
+            self._command("download_control", {"action": "start"})
         elif action == "pause-downloads":
-            self.downloader.pause()
+            self._command("download_control", {"action": "pause"})
             self._set_status("Загрузки приостановлены")
         elif action == "resume-downloads":
-            self.downloader.resume()
-            self._render_downloads()
-            self._ensure_download_worker()
+            self._command("download_control", {"action": "resume"})
         elif action == "retry-downloads":
-            for job in self.repository.list_downloads(
-                [DownloadStatus.FAILED, DownloadStatus.CANCELLED]
-            ):
-                self.downloader.retry(job.id)
-            self._render_downloads()
-            self._ensure_download_worker()
+            self._command("download_control", {"action": "retry"})
         elif action == "approve-downloads":
-            self.downloader.approve_waiting()
-            self._render_downloads()
-            self._ensure_download_worker()
+            ids = [job.id for job in self.repository.list_downloads([DownloadStatus.WAITING])]
+            if ids:
+                self._command("download_control", {"action": "approve", "ids": ids})
         elif action == "cancel-download":
             job = self._current_download()
             if job:
@@ -694,57 +750,14 @@ class ThreadgoonApp(App[None]):
             apply_selection,
         )
 
-    @work(thread=True, exclusive=True, group="scan")
     def _start_fast_scan(self) -> None:
-        self.call_from_thread(self._set_status, "Загружаю каталоги…")
-        try:
-            self.scanner.fast_scan(
-                self.config.boards,
-                on_progress=lambda current, total, _record, message: self.call_from_thread(
-                    self._scan_progress, current, total, message
-                ),
-            )
-            self.call_from_thread(self._scan_finished, "Быстрое сканирование завершено")
-        except Exception as exc:
-            self.call_from_thread(self._show_error, f"Сканирование не удалось: {exc}")
+        self._command("search", {"boards": self.config.boards})
 
-    @work(thread=True, exclusive=True, group="scan")
     def _start_deep_scan(self, records: Sequence[ThreadRecord]) -> None:
-        self.call_from_thread(self._set_status, f"Deep scan: 0/{len(records)}")
-        try:
-            self.scanner.deep_scan(
-                list(records),
-                self.filters,
-                on_progress=lambda current, total, _record, message: self.call_from_thread(
-                    self._scan_progress, current, total, message
-                ),
-            )
-            self.call_from_thread(self._scan_finished, "Deep scan завершён")
-        except Exception as exc:
-            self.call_from_thread(self._show_error, f"Deep scan не удался: {exc}")
+        self._command("deep_scan", {"keys": [f"{r.board}/{r.thread_id}" for r in records]})
 
-    def _scan_progress(self, current: int, total: int, message: str) -> None:
-        self._set_status(f"{current}/{total} · {message}")
-        self.records = self.repository.list_threads()
-        self._render_catalog()
-
-    def _scan_finished(self, message: str) -> None:
-        self.records = self.repository.list_threads()
-        self._render_catalog()
-        self._set_status(message)
-
-    @work(thread=True, exclusive=True, group="prepare-download")
     def _prepare_downloads(self, records: Sequence[ThreadRecord]) -> None:
-        try:
-            exact = self._ensure_exact(records)
-            exact = [
-                item
-                for item in exact
-                if item.status is ThreadStatus.AVAILABLE and item.attachments
-            ]
-            self.call_from_thread(self._confirm_downloads, exact)
-        except Exception as exc:
-            self.call_from_thread(self._show_error, f"Не удалось подготовить загрузку: {exc}")
+        self._command("prepare_download", {"keys": [f"{r.board}/{r.thread_id}" for r in records]})
 
     def _confirm_downloads(self, records: list[ThreadRecord]) -> None:
         if not records:
@@ -754,33 +767,20 @@ class ThreadgoonApp(App[None]):
         self.push_screen(ConfirmDownloadScreen(records), self._download_confirmed)
 
     def _download_confirmed(self, confirmed: bool) -> None:
-        if not confirmed:
-            self._prepared_downloads = []
-            return
-        count = 0
-        for record in self._prepared_downloads:
-            count += len(self.downloader.enqueue_attachments(record))
+        self._command("confirm_download" if confirmed else "discard_prepared",
+                      {"token": self._prepared_token})
         self._prepared_downloads = []
-        self._render_downloads()
-        self.query_one("#tabs", TabbedContent).active = "downloads"
-        self._set_status(f"В очередь добавлено файлов: {count}")
-        self._ensure_download_worker()
+        self._prepared_token = ""
+        if confirmed:
+            # Modal dismissal restores the old focus; switch after that restoration.
+            self.call_after_refresh(self._show_download_tab)
 
-    @work(thread=True, exclusive=True, group="prepare-watch")
+    def _show_download_tab(self) -> None:
+        self.query_one("#tabs", TabbedContent).active = "downloads"
+        self.query_one("#downloads-table", DataTable).focus()
+
     def _prepare_watches(self, records: Sequence[ThreadRecord]) -> None:
-        try:
-            exact = self._ensure_exact(records)
-            for record in exact:
-                if record.status is ThreadStatus.AVAILABLE:
-                    self.watcher.add(
-                        record.board,
-                        record.thread_id,
-                        interval=self.config.watch_interval,
-                        auto_download=self.config.auto_download_new,
-                    )
-            self.call_from_thread(self._watches_prepared, len(exact))
-        except Exception as exc:
-            self.call_from_thread(self._show_error, f"Не удалось включить мониторинг: {exc}")
+        self._command("watch_add", {"keys": [f"{r.board}/{r.thread_id}" for r in records]})
 
     def _watches_prepared(self, count: int) -> None:
         self._render_watches()
@@ -788,98 +788,13 @@ class ThreadgoonApp(App[None]):
         self._set_status(f"Добавлено в мониторинг: {count}")
 
     def _ensure_exact(self, records: Sequence[ThreadRecord]) -> list[ThreadRecord]:
-        exact: list[ThreadRecord] = []
-        for record in records:
-            stored = self.repository.get_thread(record.board, record.thread_id)
-            if stored and stored.accuracy is Accuracy.EXACT:
-                exact.append(stored)
-                continue
-            fetched = self.scanner.fetch_direct(
-                record.board, record.thread_id, self.filters
-            )
-            exact.append(fetched)
-        return exact
+        return self.controller.exact_records([record.key for record in records], self.filters)
 
-    @work(thread=True, exclusive=True, group="import")
     def _import_urls(self, urls: Sequence[str]) -> None:
-        imported = 0
-        errors: list[str] = []
-        for value in urls:
-            try:
-                board, thread_id = parse_thread_url(value)
-                self.scanner.fetch_direct(board, thread_id, self.filters)
-                imported += 1
-            except Exception as exc:
-                errors.append(f"{value}: {exc}")
-        self.call_from_thread(self._imports_finished, imported, errors)
-
-    def _imports_finished(self, imported: int, errors: list[str]) -> None:
-        self.records = self.repository.list_threads()
-        self._render_catalog()
-        if errors:
-            self._show_error("; ".join(errors))
-        else:
-            self._set_status(f"Импортировано тредов: {imported}")
+        self._command("import", {"urls": list(urls)})
 
     def _ensure_download_worker(self) -> None:
-        if self._downloads_running:
-            return
-        if not self.repository.list_downloads([DownloadStatus.PENDING]):
-            return
-        self._downloads_running = True
-        self._download_worker()
-
-    @work(thread=True, group="downloads")
-    def _download_worker(self) -> None:
-        try:
-            self.downloader.process_pending(
-                on_update=lambda job: self.call_from_thread(
-                    self._download_updated, job
-                )
-            )
-        finally:
-            self.call_from_thread(self._downloads_finished)
-
-    def _download_updated(self, _job: DownloadJob) -> None:
-        self._render_downloads()
-        self._render_history()
-
-    def _downloads_finished(self) -> None:
-        self._downloads_running = False
-        self._render_downloads()
-        self._render_history()
-        if self.repository.list_downloads([DownloadStatus.PENDING]):
-            self._ensure_download_worker()
-        else:
-            self._set_status("Очередь загрузок обработана")
-
-    @work(thread=True, exclusive=True, group="watch-loop")
-    def _start_watch_worker(self) -> None:
-        self.watcher.run_forever(
-            on_update=lambda watch, count, error: self.call_from_thread(
-                self._watch_updated, watch, count, error
-            )
-        )
-
-    def _watch_updated(
-        self,
-        watch: WatchRecord,
-        new_count: int,
-        error: str | None,
-    ) -> None:
-        self._render_watches()
-        self._render_downloads()
-        if error:
-            self._set_status(
-                f"/{watch.board}/{watch.thread_id}: {error}",
-                error=True,
-            )
-        elif new_count:
-            self._set_status(
-                f"/{watch.board}/{watch.thread_id}: новых файлов {new_count}"
-            )
-            if watch.auto_download:
-                self._ensure_download_worker()
+        self.controller.start_downloads()
 
     def _save_settings(self) -> None:
         try:
@@ -905,9 +820,9 @@ class ThreadgoonApp(App[None]):
                     "#settings-auto-download", Switch
                 ).value,
             )
-            config.validate(self.paths)
-            save_config(config, self.paths, self.config_path)
-        except (ConfigurationError, ValueError, TypeError) as exc:
+            from dataclasses import asdict
+            self.controller.dispatch("settings_save", {"config": asdict(config)})
+        except (ConfigurationError, ValueError, TypeError, RuntimeError) as exc:
             self.query_one("#settings-state", Static).update(f"Ошибка: {exc}")
             return
         self.config = config

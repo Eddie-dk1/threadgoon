@@ -1,3 +1,3 @@
-"""Threadgoon 6.0 package."""
+"""Threadgoon 6.1 package."""
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"

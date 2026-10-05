@@ -12,8 +12,12 @@ def configure_logging(paths: AppPaths, *, verbose: bool = False) -> logging.Logg
     logger = logging.getLogger("threadgoon")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.propagate = False
-    if logger.handlers:
+    destination = str(paths.logs / "threadgoon.log")
+    if any(getattr(handler, "baseFilename", "") == destination for handler in logger.handlers):
         return logger
+    for old in list(logger.handlers):
+        logger.removeHandler(old)
+        old.close()
 
     handler = RotatingFileHandler(
         paths.logs / "threadgoon.log",

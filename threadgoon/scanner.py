@@ -98,9 +98,10 @@ class ScanService:
         *,
         on_progress: ProgressCallback | None = None,
     ) -> list[ThreadRecord]:
-        self.reset_control()
         try:
             self.refresh_boards()
+        except ApiCancelled:
+            raise
         except Exception:
             if not self.repository.list_boards():
                 raise
@@ -117,6 +118,7 @@ class ScanService:
                 )
                 parsed = parse_catalog(board, result.data)
                 for record in parsed:
+                    record.stale = result.stale
                     self.repository.upsert_thread(record)
                 records.extend(parsed)
                 message = (
@@ -145,7 +147,6 @@ class ScanService:
         *,
         on_progress: ProgressCallback | None = None,
     ) -> list[ThreadRecord]:
-        self.reset_control()
         completed: list[ThreadRecord] = []
         total = len(records)
         for index, record in enumerate(records, start=1):
@@ -159,8 +160,8 @@ class ScanService:
                     cancel_event=self.cancel_event,
                 )
                 exact = parse_thread(record.board, result.data, filters)
-                self.repository.upsert_thread(exact)
-                self.repository.upsert_attachments(exact.attachments)
+                exact.stale = result.stale
+                self._persist_exact(exact)
                 completed.append(exact)
                 message = (
                     f"/{record.board}/{record.thread_id}: "
@@ -200,19 +201,37 @@ class ScanService:
         thread_id: int,
         filters: ScanFilters,
     ) -> ThreadRecord:
-        self.reset_control()
+        self._wait_if_paused()
         result = self.api.fetch_thread(
             board, thread_id, cancel_event=self.cancel_event
         )
         record = parse_thread(board, result.data, filters)
+        record.stale = result.stale
+        self._persist_exact(record)
+        return record
+
+    def _persist_exact(self, record: ThreadRecord) -> None:
         self.repository.upsert_thread(record)
         self.repository.upsert_attachments(record.attachments)
-        return record
+        saved = {item.key: item for item in self.repository.get_attachments(record.board, record.thread_id)}
+        for item in record.attachments:
+            previous = saved.get(item.key)
+            if previous:
+                item.local_path = previous.local_path
+                item.thumbnail_path = previous.thumbnail_path
 
     def _wait_if_paused(self) -> None:
         while not self.pause_event.wait(0.1):
             if self.cancel_event.is_set():
-                return
+                raise ApiCancelled("Операция отменена")
+        if self.cancel_event.is_set():
+            raise ApiCancelled("Операция отменена")
+
+
+def thumbnail_url(board: str, post: dict) -> str:
+    if post.get("tim") and not post.get("spoiler") and not post.get("filedeleted"):
+        return f"https://i.4cdn.org/{board}/{int(post['tim'])}s.jpg"
+    return ""
 
 
 def parse_catalog(board: str, payload: object) -> list[ThreadRecord]:
@@ -235,12 +254,12 @@ def parse_catalog(board: str, payload: object) -> list[ThreadRecord]:
                 or f"thread_{thread_id}"
             ).strip()
             snippet = strip_html(str(item.get("com", "")))[:240]
-            estimated = int(item.get("images", 1 if item.get("tim") else 0) or 0)
+            estimated = int(item.get("images", 0) or 0) + int(bool(item.get("tim") and not item.get("filedeleted")))
             records.append(
                 ThreadRecord(
                     board=board,
                     thread_id=thread_id,
-                    title=title,
+                    title=strip_html(title),
                     semantic_url=semantic_url,
                     source_url=source_thread_url(board, thread_id),
                     file_count=estimated,
@@ -249,6 +268,7 @@ def parse_catalog(board: str, payload: object) -> list[ThreadRecord]:
                     status=ThreadStatus.AVAILABLE,
                     snippet=snippet,
                     updated_at=now,
+                    thumbnail_url=thumbnail_url(board, item),
                 )
             )
     return records
@@ -274,11 +294,12 @@ def parse_thread(
     attachments, snippet = collect_attachments(board, posts, filters)
     if len(attachments) < filters.min_matched_files:
         attachments = []
-    total_size = sum(item.size or 0 for item in attachments)
+    total_size = (sum(item.size or 0 for item in attachments)
+                  if all(item.size is not None for item in attachments) else None)
     return ThreadRecord(
         board=board,
         thread_id=thread_id,
-        title=title,
+        title=strip_html(title),
         semantic_url=semantic_url,
         source_url=source_thread_url(board, thread_id),
         file_count=len(attachments),
@@ -288,6 +309,7 @@ def parse_thread(
         snippet=snippet or strip_html(str(op.get("com", "")))[:240],
         updated_at=time.time(),
         attachments=attachments,
+        thumbnail_url=thumbnail_url(board, op),
     )
 
 
@@ -313,7 +335,7 @@ def collect_attachments(
     for post, _text, post_matches in normalized_posts:
         ext = str(post.get("ext", "") or "").casefold()
         tim = post.get("tim")
-        if not ext or ext not in filters.extensions or not tim:
+        if not ext or ext not in filters.extensions or not tim or post.get("filedeleted"):
             continue
         size = post.get("fsize")
         size = int(size) if isinstance(size, int) else None
@@ -322,7 +344,7 @@ def collect_attachments(
         ):
             continue
         if filters.max_file_size is not None and (
-            size is not None and size > filters.max_file_size
+            size is None or size > filters.max_file_size
         ):
             continue
         if (
